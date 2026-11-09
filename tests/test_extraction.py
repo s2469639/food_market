@@ -89,3 +89,38 @@ class ExtractionTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ExtractionError, "복구할 수 없습니다"):
                 recheck(directory)
+
+    def test_stop_with_valid_tool_recovers_saved_response_without_api(self):
+        import hashlib
+        from market_compass.extract import make_request
+        source = json.loads(SOURCE.read_text())
+        raw = response()
+        raw["choices"][0]["finish_reason"] = "stop"
+        raw["choices"][0]["message"]["content"] = None
+        raw["usage"] = {"prompt_tokens": 503, "completion_tokens": 171, "total_tokens": 674}
+        with TemporaryDirectory() as directory:
+            key = hashlib.sha256(json.dumps(make_request(source), ensure_ascii=False).encode()).hexdigest()
+            folder = Path(directory) / key
+            folder.mkdir()
+            (folder / "received.json").write_text(json.dumps({"source": source, "response": raw}))
+            (folder / "attempt.json").write_text(json.dumps({"status": "failed_or_unvalidated"}))
+            with patch("market_compass.extract.load_key", side_effect=AssertionError("no key")), patch("market_compass.extract.urlopen", side_effect=AssertionError("no network")):
+                recovered = recheck(directory)
+                self.assertEqual(recovered["network_calls"], 0)
+                self.assertEqual(json.loads((folder / "result.json").read_text())["usage"], raw["usage"])
+                self.assertEqual(json.loads((folder / "attempt.json").read_text())["previous_attempt"]["status"], "failed_or_unvalidated")
+                opener = Mock(side_effect=AssertionError("no network"))
+                self.assertEqual(run(execute=True, output_dir=directory, opener=opener)["mode"], "cached")
+                opener.assert_not_called()
+                before = (folder / "result.json").read_bytes()
+                recheck(directory)
+                self.assertEqual((folder / "result.json").read_bytes(), before)
+
+    def test_stop_without_call_and_stop_with_bad_quote_still_rejected(self):
+        source = json.loads(SOURCE.read_text())
+        for raw, pattern in [(response(), "도구 호출"), (response("invented quote"), "인용문")]:
+            raw["choices"][0]["finish_reason"] = "stop"
+            if pattern == "도구 호출":
+                raw["choices"][0]["message"]["tool_calls"] = []
+            with self.assertRaisesRegex(ExtractionError, pattern):
+                validate_response(raw, source)

@@ -76,8 +76,10 @@ def validate_response(response, source):
         if reason == "length":
             raise ExtractionError("응답이 출력 길이 제한으로 잘렸습니다. 저장된 응답을 확인하세요.")
         calls = choice["message"].get("tool_calls", [])
-        if reason != "tool_calls" or len(calls) != 1:
+        if reason not in {"tool_calls", "stop"} or len(calls) != 1:
             raise ExtractionError("근거 반환 도구 호출을 1건 확보하지 못했습니다. 저장된 응답을 확인하세요.")
+        if choice["message"].get("refusal"):
+            raise ExtractionError("모델이 요청을 거절했습니다. 결과를 채택하지 않습니다.")
         function = calls[0]["function"]
         if function["name"] != "submit_evidence":
             raise ExtractionError("예상한 도구 이름과 다릅니다.")
@@ -109,8 +111,20 @@ def recheck(output_dir=ROOT / "reports" / "extraction"):
     if saved["source"] != source:
         raise ExtractionError("저장된 원문과 현재 시험 원문이 다릅니다.")
     extraction, usage = validate_response(saved["response"], source)
-    return {"mode": "rechecked", "network_calls": 0, "extraction": extraction,
-            "usage": usage, "review_status": "needs_human_review"}
+    result_file = directory / "result.json"
+    if not result_file.exists():
+        result = {"created_at": datetime.now(timezone.utc).isoformat(), "model": MODEL,
+                  "response_model": saved["response"].get("model"), "request_sha256": directory.name,
+                  "source": source, "extraction": extraction, "usage": usage,
+                  "review_status": "needs_human_review", "recovered_without_network": True,
+                  "note": "저장된 응답을 로컬에서 재검증했습니다. API를 호출하지 않았으며 해석은 수동 확인이 필요합니다."}
+        write_json(result_file, result)
+        attempt_file = directory / "attempt.json"
+        previous = json.loads(attempt_file.read_text(encoding="utf-8")) if attempt_file.exists() else None
+        write_json(attempt_file, {"status": "completed", "usage": usage,
+                                  "recovered_without_network": True, "previous_attempt": previous})
+    return {"mode": "rechecked", "network_calls": 0, "result_file": str(result_file),
+            "extraction": extraction, "usage": usage, "review_status": "needs_human_review"}
 
 
 def run(*, execute=False, env_file=ROOT / ".env", output_dir=ROOT / "reports" / "extraction", opener=urlopen):
