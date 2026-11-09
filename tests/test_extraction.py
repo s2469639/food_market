@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
-from market_compass.extract import SOURCE, ExtractionError, load_key, run
+from market_compass.extract import SOURCE, ExtractionError, load_key, run, recheck, validate_response
 
 
 def response(quote=None):
@@ -48,6 +48,8 @@ class ExtractionTests(unittest.TestCase):
             self.assertNotIn("dummy-key", Path(first["result_file"]).read_text())
             self.assertEqual(run(execute=True, output_dir=directory, opener=opener)["mode"], "cached")
             self.assertEqual(opener.call_count, 1)
+            with patch("market_compass.extract.load_key", side_effect=AssertionError("no key read")):
+                self.assertEqual(recheck(directory)["network_calls"], 0)
 
     def test_invalid_quote_keeps_usage_and_blocks_repeat(self):
         with TemporaryDirectory() as directory, patch.dict(os.environ, {"OPENAI_API_KEY": "dummy-key"}, clear=True):
@@ -55,6 +57,9 @@ class ExtractionTests(unittest.TestCase):
             with self.assertRaises(ExtractionError):
                 run(execute=True, output_dir=directory, opener=opener)
             self.assertFalse(list(Path(directory).rglob('result.json')))
+            self.assertTrue(list(Path(directory).rglob('received.json')))
+            with self.assertRaisesRegex(ExtractionError, "인용문"):
+                recheck(directory)
             state = json.loads(next(Path(directory).rglob('attempt.json')).read_text())
             self.assertEqual(state["usage"]["total_tokens"], 300)
             with self.assertRaises(ExtractionError):
@@ -69,3 +74,18 @@ class ExtractionTests(unittest.TestCase):
             self.assertNotIn("dummy-key", str(caught.exception))
             self.assertEqual(opener.call_count, 1)
             self.assertNotIn("dummy-key", next(Path(directory).rglob('attempt.json')).read_text())
+            self.assertFalse(list(Path(directory).rglob('received.json')))
+
+    def test_failure_types_and_legacy_recheck(self):
+        source = json.loads(SOURCE.read_text())
+        truncated = response()
+        truncated["choices"][0]["finish_reason"] = "length"
+        with self.assertRaisesRegex(ExtractionError, "길이 제한"):
+            validate_response(truncated, source)
+        invalid = response()
+        invalid["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = '{}'
+        with self.assertRaisesRegex(ExtractionError, "필드 형식"):
+            validate_response(invalid, source)
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ExtractionError, "복구할 수 없습니다"):
+                recheck(directory)

@@ -72,21 +72,45 @@ def make_request(source):
 def validate_response(response, source):
     try:
         choice = response["choices"][0]
-        calls = choice["message"]["tool_calls"]
-        if choice["finish_reason"] != "tool_calls" or len(calls) != 1:
-            raise ValueError()
+        reason = choice.get("finish_reason")
+        if reason == "length":
+            raise ExtractionError("응답이 출력 길이 제한으로 잘렸습니다. 저장된 응답을 확인하세요.")
+        calls = choice["message"].get("tool_calls", [])
+        if reason != "tool_calls" or len(calls) != 1:
+            raise ExtractionError("근거 반환 도구 호출을 1건 확보하지 못했습니다. 저장된 응답을 확인하세요.")
         function = calls[0]["function"]
         if function["name"] != "submit_evidence":
-            raise ValueError()
-        result = Extraction.model_validate_json(function["arguments"])
-        if not result.quotes or any(not q.strip() or q not in source["excerpt"] for q in result.quotes):
-            raise ValueError()
+            raise ExtractionError("예상한 도구 이름과 다릅니다.")
+        try:
+            result = Extraction.model_validate_json(function["arguments"])
+        except ValueError:
+            raise ExtractionError("도구 인수의 JSON 또는 필드 형식이 다릅니다. received.json을 확인하세요.") from None
+        if not result.quotes:
+            raise ExtractionError("인용 근거가 비어 있습니다. 근거 부족으로 수동 확인이 필요합니다.")
+        if any(not q.strip() or q not in source["excerpt"] for q in result.quotes):
+            raise ExtractionError("인용문이 원문과 정확히 일치하지 않습니다. received.json에서 인용을 확인하세요.")
         usage = response["usage"]
-        if any(type(usage.get(k)) is not int or usage[k] < 0 for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
-            raise ValueError()
+        if not isinstance(usage, dict) or any(type(usage.get(k)) is not int or usage[k] < 0 for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
+            raise ExtractionError("사용량 필드가 없거나 올바르지 않습니다.")
         return result.model_dump(), usage
     except (KeyError, IndexError, TypeError, ValueError):
-        raise ExtractionError("응답 형식 또는 인용이 원문과 일치하지 않습니다. 수동 확인이 필요합니다.") from None
+        raise ExtractionError("응답의 필수 구조가 없습니다. received.json을 확인하세요.") from None
+
+
+def recheck(output_dir=ROOT / "reports" / "extraction"):
+    """Validate saved response without credentials, API calls, or a new attempt."""
+    source = json.loads(SOURCE.read_text(encoding="utf-8"))
+    body = json.dumps(make_request(source), ensure_ascii=False).encode()
+    directory = Path(output_dir) / hashlib.sha256(body).hexdigest()
+    received = directory / "received.json"
+    if not received.exists():
+        raise ExtractionError("저장된 received.json이 없습니다. 이전 버전은 실패 응답을 보관하지 않아 복구할 수 없습니다. 자동 재호출하지 않습니다.")
+    saved = json.loads(received.read_text(encoding="utf-8"))
+    if saved["source"] != source:
+        raise ExtractionError("저장된 원문과 현재 시험 원문이 다릅니다.")
+    extraction, usage = validate_response(saved["response"], source)
+    return {"mode": "rechecked", "network_calls": 0, "extraction": extraction,
+            "usage": usage, "review_status": "needs_human_review"}
 
 
 def run(*, execute=False, env_file=ROOT / ".env", output_dir=ROOT / "reports" / "extraction", opener=urlopen):
@@ -118,6 +142,10 @@ def run(*, execute=False, env_file=ROOT / ".env", output_dir=ROOT / "reports" / 
     try:
         with opener(request, timeout=60) as response:
             raw = json.load(response)
+        if isinstance(raw, dict):
+            # Only model output and usage; no provider headers or HTTP error bodies.
+            write_json(directory / "received.json", {"source": source,
+                       "response": {k: raw.get(k) for k in ("choices", "usage", "model")}})
         extraction, usage = validate_response(raw, source)
         result = {"created_at": datetime.now(timezone.utc).isoformat(), "model": MODEL,
                   "response_model": raw.get("model"), "request_sha256": key_hash, "source": source,
@@ -131,7 +159,9 @@ def run(*, execute=False, env_file=ROOT / ".env", output_dir=ROOT / "reports" / 
         # Never log provider bodies, request headers, exception messages, or credentials.
         usage = raw.get("usage") if isinstance(raw, dict) else None
         safe_usage = {k: v for k, v in (usage or {}).items() if k in {"prompt_tokens", "completion_tokens", "total_tokens"} and type(v) is int} if isinstance(usage, dict) else None
-        state = {"status": "failed_or_unvalidated", "charge_status": "unknown; may have been charged", "usage": safe_usage}
+        state = {"status": "failed_or_unvalidated", "charge_status": "unknown; may have been charged", "usage": safe_usage,
+                 "failure_kind": "http_error" if isinstance(error, HTTPError) else "validation_or_storage",
+                 "http_status": error.code if isinstance(error, HTTPError) else None}
         write_json(attempt_file, state)
         if isinstance(error, ExtractionError):
             raise
@@ -142,10 +172,12 @@ def run(*, execute=False, env_file=ROOT / ".env", output_dir=ROOT / "reports" / 
 
 def main():
     parser = argparse.ArgumentParser(description="공개 ABS 발췌 1건의 근거 추출 시험")
-    parser.add_argument("--execute", action="store_true", help="실제 유료 API 요청 1회를 허용")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--recheck", action="store_true", help="저장된 응답만 무료 재검증")
+    mode.add_argument("--execute", action="store_true", help="실제 유료 API 요청 1회를 허용")
     args = parser.parse_args()
     try:
-        print(json.dumps(run(execute=args.execute), ensure_ascii=False, indent=2))
+        print(json.dumps(recheck() if args.recheck else run(execute=args.execute), ensure_ascii=False, indent=2))
         return 0
     except (ExtractionError, OSError, ValueError):
         import sys
