@@ -5,3 +5,4 @@ pytz==2026.6
 tzdata==2026.6
 fastapi==0.162.2
 uvicorn==0.54.0
+pydantic==2.14.3
