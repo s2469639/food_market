@@ -20,3 +20,14 @@ reports/
 logs/
 *.log
 .DS_Store
+node_modules/
+web/dist/
+*.tsbuildinfo
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.sqlite-*
+*.db
+*.db-*
+test-results/
+playwright-report/

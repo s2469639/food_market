@@ -3,3 +3,5 @@ numpy==2.5.4
 python-dateutil==4.0.0
 pytz==2026.6
 tzdata==2026.6
+fastapi==0.162.2
+uvicorn==0.54.0
