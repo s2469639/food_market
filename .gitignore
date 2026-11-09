@@ -1,0 +1,22 @@
+# Local credentials: only the empty template may be tracked.
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!/.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# Local environments, data and generated reports
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+reports/
+logs/
+*.log
+.DS_Store
